@@ -31,6 +31,8 @@ pub enum ApiError {
     TooManyRequests(String),
     /// 500 — an internal error. The detail is logged, never returned to the client.
     Internal,
+    /// 504 — an upstream dependency (e.g. Horizon) did not answer within the route's time budget.
+    GatewayTimeout(String),
 }
 
 impl ApiError {
@@ -47,6 +49,7 @@ impl ApiError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal server error".into(),
             ),
+            ApiError::GatewayTimeout(m) => (StatusCode::GATEWAY_TIMEOUT, m.clone()),
         }
     }
 }

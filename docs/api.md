@@ -47,7 +47,9 @@ decrypt. Consequently:
   **Never returns a mnemonic** — the client generated it and the server never saw it.
 - `GET  /v1/wallets` — list your wallets (paginated).
 - `GET  /v1/wallets/{id}` — wallet details.
-- `GET  /v1/wallets/{id}/balances` — live on-chain balances.
+- `GET  /v1/wallets/{id}/balances` — live on-chain balances. Fetched synchronously from
+  Horizon under a **10 s** route timeout (independent of per-attempt retries); if Horizon is
+  slower than that, the request ends with `504` in the standard envelope — safe to retry.
 - `GET  /v1/wallets/{id}/transactions` — deposits + outbound transfers (paginated).
 - `GET  /v1/wallets/{id}/backup` — the opaque client-encrypted backup blob, for new-device
   recovery. **Dashboard JWT only.** Useless without the user's password.
@@ -77,6 +79,11 @@ carries fee float only — the one server-held key in the system, bounded by you
   gets `401`). Idempotent: a second call returns the existing tank.
 - `GET  /v1/wallets/{id}/sponsorship` / `PUT` — read/update `enabled`, the per-transaction fee
   cap, and the daily budget.
+  - `daily_budget_stroops`: `null`/omitted = **unlimited**; `0` = sponsorship **fully disabled**
+    for the day (every sponsor request gets `429`); negative → `400`.
+  - `per_tx_fee_cap_stroops`: `null`/omitted = no per-transaction cap; negative → `400`.
+  - When both are set, `per_tx_fee_cap_stroops` must be `<=` `daily_budget_stroops`, otherwise
+    `400` naming both values. Either field may be left unset independently.
 - `POST /v1/wallets/{id}/sponsor` — fee-bump a user's **already-signed** inner transaction.
   The gas tank signs only the outer fee-bump envelope; the inner transaction is passed through
   untouched. Over budget → `429`; duplicate inner tx → `409`.
@@ -118,4 +125,5 @@ so it cannot escalate or revoke itself.
   `{ statusCode, message, data: { data: [...], next_cursor } }`.
 - **Amounts** are integer **stroops** (1 XLM = 10,000,000) end-to-end — never floats.
 - **Errors** map to `400` (validation), `401`, `403`, `404`, `409` (conflict), `410` (removed
-  custodial endpoints), `413` (body over 64 KiB), `429` (budget exceeded). There is no `422`.
+  custodial endpoints), `413` (body over 64 KiB), `429` (budget exceeded), `504` (upstream
+  Horizon exceeded a route timeout). There is no `422`.

@@ -87,6 +87,15 @@ pub async fn put_config(
             ));
         }
     }
+    // A per-tx cap above the daily budget can never be fully used; reject the contradiction.
+    if let (Some(cap), Some(budget)) = (req.per_tx_fee_cap_stroops, req.daily_budget_stroops) {
+        if cap > budget {
+            return Err(ApiError::BadRequest(format!(
+                "per_tx_fee_cap_stroops ({cap}) must not exceed daily_budget_stroops ({budget}); \
+                 lower the per-transaction cap or raise the daily budget"
+            )));
+        }
+    }
 
     let config = state
         .store()

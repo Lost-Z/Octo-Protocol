@@ -167,6 +167,10 @@ impl Store {
     // --- email OTP ----------------------------------------------------------
 
     /// Issue a fresh OTP row. Callers hash the code themselves before calling this.
+    ///
+    /// Invariant: at most one live (unconsumed) OTP per `(user_id, purpose)` at any time. Any
+    /// prior unconsumed OTP for the same pair is marked consumed in the same transaction as the
+    /// insert, so this holds regardless of caller or of how `verify_and_consume_otp` queries.
     pub async fn create_otp(
         &self,
         user_id: Uuid,
@@ -175,6 +179,25 @@ impl Store {
         tx_hash_bound: Option<&str>,
         ttl: chrono::Duration,
     ) -> Result<Uuid, StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Serialize issuers per (user, purpose) so concurrent calls can't both leave a live row.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text || ':' || $2, 0))")
+            .bind(user_id)
+            .bind(purpose)
+            .execute(&mut *tx)
+            .await?;
+
+        // Supersede every still-live OTP for this (user, purpose) before issuing the new one.
+        sqlx::query(
+            "UPDATE email_otps SET consumed_at = now()
+             WHERE user_id = $1 AND purpose = $2 AND consumed_at IS NULL",
+        )
+        .bind(user_id)
+        .bind(purpose)
+        .execute(&mut *tx)
+        .await?;
+
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO email_otps (user_id, purpose, code_hash, tx_hash_bound, expires_at)
              VALUES ($1, $2, $3, $4, now() + $5) RETURNING id",
@@ -184,8 +207,10 @@ impl Store {
         .bind(code_hash)
         .bind(tx_hash_bound)
         .bind(ttl)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+
+        tx.commit().await?;
         Ok(id)
     }
 
@@ -227,10 +252,19 @@ impl Store {
             return Err(StoreError::InvalidOtp);
         }
 
-        sqlx::query("UPDATE email_otps SET consumed_at = now() WHERE id = $1")
-            .bind(otp.id)
-            .execute(&self.pool)
-            .await?;
+        // Conditional consume: two concurrent correct submissions can't both succeed, and a code
+        // can't be consumed once the attempt limit is reached by racing wrong guesses.
+        let consumed = sqlx::query(
+            "UPDATE email_otps SET consumed_at = now()
+             WHERE id = $1 AND consumed_at IS NULL AND attempts < $2 AND expires_at >= now()",
+        )
+        .bind(otp.id)
+        .bind(MAX_ATTEMPTS)
+        .execute(&self.pool)
+        .await?;
+        if consumed.rows_affected() != 1 {
+            return Err(StoreError::InvalidOtp);
+        }
         Ok(())
     }
 
@@ -1578,7 +1612,9 @@ impl Store {
     /// Atomically reserve budget and record a sponsored transaction.
     ///
     /// Inserts a `pending` row **only if** doing so keeps today's reserved fees within
-    /// `daily_budget_stroops` (a `NULL` budget means unlimited). The check and insert happen in one
+    /// `daily_budget_stroops`. Semantics match [`GasSponsorshipConfig::daily_budget_stroops`]:
+    /// `None` = unlimited, `Some(0)` (or, defensively, any non-positive value) = sponsorship
+    /// disabled, refused without touching the database. The check and insert happen in one
     /// statement (a conditional CTE), so concurrent sponsorships can't oversubscribe the budget.
     /// Returns `StoreError::BudgetExceeded` if the budget would be exceeded, or
     /// `StoreError::Conflict` if this `inner_tx_hash` was already sponsored (double-submit).
@@ -1589,6 +1625,15 @@ impl Store {
         fee_stroops: i64,
         daily_budget_stroops: Option<i64>,
     ) -> Result<SponsoredTransaction, StoreError> {
+        // A zero (or corrupt negative) budget blocks all sponsorship, even a zero-fee reservation.
+        if matches!(daily_budget_stroops, Some(b) if b <= 0) {
+            return Err(StoreError::BudgetExceeded);
+        }
+        // A non-positive fee would never be charged and could offset today's spend; refuse it.
+        if fee_stroops <= 0 {
+            return Err(StoreError::BudgetExceeded);
+        }
+
         // The read-then-insert below must be serialized per wallet. A bare conditional CTE is NOT
         // enough: under READ COMMITTED every concurrent transaction computes `spent` from a
         // snapshot taken before the others' inserts are visible, so N requests can each see the

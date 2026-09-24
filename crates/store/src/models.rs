@@ -206,7 +206,9 @@ pub struct GasSponsorshipConfig {
     pub enabled: bool,
     /// Max fee (stroops) the sponsor pays per transaction; `None` = no cap.
     pub per_tx_fee_cap_stroops: Option<i64>,
-    /// Rolling UTC-day budget (stroops); `None` = no budget limit.
+    /// Rolling UTC-day budget (stroops). `None` = unlimited; `Some(0)` = sponsorship fully
+    /// disabled for the day (every reservation is refused). Negative values are rejected at the
+    /// API and, defensively, treated like `Some(0)` by the store (fail closed).
     pub daily_budget_stroops: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
