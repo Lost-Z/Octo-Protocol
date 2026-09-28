@@ -1883,8 +1883,10 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chrono",
+ "dotenvy",
  "hex",
  "hmac",
+ "octo-resilience",
  "octo-store",
  "reqwest",
  "serde",

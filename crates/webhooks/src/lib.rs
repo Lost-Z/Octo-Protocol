@@ -10,8 +10,12 @@
 
 pub mod sign;
 
+use octo_resilience::{CallKind, CircuitBreaker, ResilienceError, Retriable, RetryPolicy};
 use octo_store::Store;
 use serde_json::json;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -25,12 +29,50 @@ pub struct Event {
 
 pub const DEFAULT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Most bytes of an endpoint's response body kept in the delivery log (bounds table growth).
+pub const RESPONSE_SNIPPET_MAX_BYTES: usize = 1024;
+
+/// Extra bytes read past the snippet cap so a secret straddling the cut is still redacted.
+const REDACTION_SLACK_BYTES: usize = 1024;
+
+/// Default retry policy: 3 attempts, ~1s then ~2s backoff, bounded by the delivery timeout.
+fn default_retry_policy() -> RetryPolicy {
+    RetryPolicy {
+        max_attempts: 3,
+        base_delay_ms: 1_000,
+        max_delay_ms: 4_000,
+        ..RetryPolicy::default()
+    }
+}
+
+/// What a single HTTP attempt observed — the only response data that is persisted.
+#[derive(Debug, Clone, Default)]
+struct AttemptOutcome {
+    /// HTTP status, or `None` for a connection error / per-request timeout.
+    status: Option<u16>,
+    /// Redacted, truncated response body.
+    body_snippet: Option<String>,
+}
+
+impl AttemptOutcome {
+    fn is_success(&self) -> bool {
+        matches!(self.status, Some(s) if (200..300).contains(&s))
+    }
+}
+
+// Transport errors and 5xx are transient; any other non-2xx is the endpoint's final answer.
+impl Retriable for AttemptOutcome {
+    fn is_retriable(&self) -> bool {
+        self.status.is_none_or(|s| s >= 500)
+    }
+}
+
 /// Sends signed webhooks for a wallet's active endpoints, with retry + delivery logging.
 #[derive(Clone)]
 pub struct WebhookSender {
     store: Store,
     http: reqwest::Client,
-    max_attempts: u32,
+    retry_policy: RetryPolicy,
     delivery_timeout: Duration,
 }
 
@@ -42,14 +84,20 @@ impl WebhookSender {
                 .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),
-            max_attempts: 3,
+            retry_policy: default_retry_policy(),
             delivery_timeout: DEFAULT_DELIVERY_TIMEOUT,
         }
     }
 
-    /// Set a custom total delivery timeout ceiling per endpoint attempt (default is 20s).
+    /// Set a custom total delivery timeout ceiling per endpoint, across all retries (default 20s).
     pub fn with_delivery_timeout(mut self, timeout: Duration) -> Self {
         self.delivery_timeout = timeout;
+        self
+    }
+
+    /// Override the retry policy (attempt count and backoff) used for each endpoint.
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
         self
     }
 
@@ -77,7 +125,15 @@ impl WebhookSender {
                 tracing::warn!(url = %ep.url, "skipping webhook to unsafe URL");
                 let _ = self
                     .store
-                    .log_webhook_delivery(ep.id, &event.event_type, &body, "failed", 0, None)
+                    .log_webhook_delivery(
+                        ep.id,
+                        &event.event_type,
+                        &body,
+                        "failed",
+                        0,
+                        None,
+                        None,
+                    )
                     .await;
                 continue;
             }
@@ -91,7 +147,7 @@ impl WebhookSender {
         delivered
     }
 
-    /// Try to deliver to one endpoint, retrying with backoff. Logs the final outcome.
+    /// Deliver to one endpoint via `octo_resilience::execute`, then log the final outcome.
     async fn deliver_with_retry(
         &self,
         ep: &octo_store::WebhookEndpoint,
@@ -100,94 +156,130 @@ impl WebhookSender {
         body_bytes: &[u8],
     ) -> bool {
         let signature = sign::sign(ep.secret.as_bytes(), body_bytes);
-        let mut last_code: Option<i32> = None;
-        let mut attempts_made = 0;
+        // Fresh per delivery and never tripping: one endpoint's outage must not gate another's.
+        let circuit = CircuitBreaker::new(u32::MAX, Duration::ZERO);
+        // Atomic (not Cell) so the dispatch future stays `Send` for callers that spawn it.
+        let attempts = AtomicU32::new(0);
+        // Last observation, kept so a deadline mid-retry still logs what the endpoint said.
+        let last = Mutex::new(AttemptOutcome::default());
+        let (attempts_ref, last_ref, signature_ref) = (&attempts, &last, signature.as_str());
 
-        let res = tokio::time::timeout(self.delivery_timeout, async {
-            for attempt in 1..=self.max_attempts {
-                attempts_made = attempt;
-                let resp = self
-                    .http
-                    .post(&ep.url)
-                    .header("content-type", "application/json")
-                    .header(sign::SIGNATURE_HEADER, &signature)
-                    .body(body_bytes.to_vec())
-                    .send()
-                    .await;
-
-                match resp {
-                    Ok(r) => {
-                        let code = r.status().as_u16() as i32;
-                        last_code = Some(code);
-                        if r.status().is_success() {
-                            return Ok(attempt);
-                        }
+        let result = tokio::time::timeout(
+            self.delivery_timeout,
+            octo_resilience::execute(&circuit, &self.retry_policy, CallKind::ReadOnly, move || {
+                attempts_ref.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    let outcome = self.attempt_once(ep, signature_ref, body_bytes).await;
+                    *last_ref.lock().unwrap() = outcome.clone();
+                    if outcome.is_success() {
+                        Ok(outcome)
+                    } else {
+                        Err(outcome)
                     }
-                    Err(_) => last_code = None,
                 }
-
-                if attempt < self.max_attempts {
-                    // Exponential backoff: 1s, 2s, ...
-                    tokio::time::sleep(Duration::from_secs(1 << (attempt - 1))).await;
-                }
-            }
-            Err(())
-        })
+            }),
+        )
         .await;
 
-        match res {
-            Ok(Ok(successful_attempt)) => {
-                let _ = self
-                    .store
-                    .log_webhook_delivery(
-                        ep.id,
-                        event_type,
-                        body,
-                        "delivered",
-                        successful_attempt as i32,
-                        last_code,
-                    )
-                    .await;
-                true
-            }
-            Ok(Err(())) => {
-                let _ = self
-                    .store
-                    .log_webhook_delivery(
-                        ep.id,
-                        event_type,
-                        body,
-                        "failed",
-                        self.max_attempts as i32,
-                        last_code,
-                    )
-                    .await;
-                false
-            }
+        let (status, outcome) = match result {
+            Ok(Ok(outcome)) => ("delivered", outcome),
+            Ok(Err(ResilienceError::Exhausted(outcome))) => ("failed", outcome),
+            Ok(Err(ResilienceError::Circuit)) => ("failed", take_last(&last)),
             Err(_) => {
                 tracing::warn!(
                     endpoint_id = %ep.id,
                     url = %ep.url,
                     timeout_secs = self.delivery_timeout.as_secs(),
-                    "webhook delivery attempt exceeded overall deadline"
+                    "webhook delivery exceeded overall deadline"
                 );
-                let attempts = if attempts_made > 0 {
-                    attempts_made as i32
-                } else {
-                    1
-                };
-                let _ = self
-                    .store
-                    .log_webhook_delivery(ep.id, event_type, body, "failed", attempts, last_code)
-                    .await;
-                false
+                ("failed", take_last(&last))
             }
+        };
+
+        let _ = self
+            .store
+            .log_webhook_delivery(
+                ep.id,
+                event_type,
+                body,
+                status,
+                attempts.load(Ordering::Relaxed).max(1) as i32,
+                outcome.status.map(i32::from),
+                outcome.body_snippet.as_deref(),
+            )
+            .await;
+        status == "delivered"
+    }
+
+    /// One signed POST. Reads at most a bounded prefix of the response body.
+    async fn attempt_once(
+        &self,
+        ep: &octo_store::WebhookEndpoint,
+        signature: &str,
+        body_bytes: &[u8],
+    ) -> AttemptOutcome {
+        let resp = self
+            .http
+            .post(&ep.url)
+            .header("content-type", "application/json")
+            .header(sign::SIGNATURE_HEADER, signature)
+            .body(body_bytes.to_vec())
+            .send()
+            .await;
+        let Ok(mut resp) = resp else {
+            return AttemptOutcome::default();
+        };
+        let status = resp.status().as_u16();
+
+        // Stream only a bounded prefix so a huge error page can't balloon memory.
+        let limit = RESPONSE_SNIPPET_MAX_BYTES + REDACTION_SLACK_BYTES;
+        let mut raw = Vec::new();
+        while raw.len() < limit {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    let take = chunk.len().min(limit - raw.len());
+                    raw.extend_from_slice(&chunk[..take]);
+                }
+                _ => break,
+            }
+        }
+
+        AttemptOutcome {
+            status: Some(status),
+            body_snippet: response_snippet(&raw, &[signature, ep.secret.as_str()]),
         }
     }
 }
 
+/// Take the last attempt's outcome, tolerating a poisoned lock (logging must still happen).
+fn take_last(last: &Mutex<AttemptOutcome>) -> AttemptOutcome {
+    std::mem::take(&mut *last.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Redact `secrets` from a response body and truncate it to [`RESPONSE_SNIPPET_MAX_BYTES`] on a
+/// char boundary. An endpoint echoing our headers back must never land the signature in the log.
+fn response_snippet(raw: &[u8], secrets: &[&str]) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+    let mut text = String::from_utf8_lossy(raw).into_owned();
+    for secret in secrets.iter().filter(|s| !s.is_empty()) {
+        text = text.replace(secret, "[redacted]");
+    }
+    let mut cut = text.len().min(RESPONSE_SNIPPET_MAX_BYTES);
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
+    Some(text)
+}
+
 /// Reject obviously-internal webhook targets (defense-in-depth against SSRF). Only `http`/`https`
 /// to non-loopback, non-private hosts are allowed.
+///
+/// The host is taken from the WHATWG-normalised URL — the same parse `reqwest` connects with — so
+/// alternate encodings (`[::ffff:7f00:1]`, `0x7f.1`, `2130706433`, `0`) are classified by the
+/// address they actually reach, not by how they were spelled.
 pub fn is_safe_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     if !(lower.starts_with("http://") || lower.starts_with("https://")) {
@@ -199,110 +291,61 @@ pub fn is_safe_url(url: &str) -> bool {
     if allow_local {
         return true;
     }
-    // Extract host between scheme and the next '/' or ':'.
-    let after_scheme = match lower.split_once("://") {
-        Some((_, rest)) => rest,
-        None => return false,
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
     };
-    // A bracketed IPv6 literal must be extracted before splitting on ':', otherwise
-    // "[fe80::1]/hook" is cut at the first colon and every check below sees "fe80" — matching
-    // nothing, so link-local IPv6 was silently allowed through.
-    let host: &str = if let Some(rest) = after_scheme.strip_prefix('[') {
-        match rest.split_once(']') {
-            Some((inside, _)) => inside,
-            None => return false, // malformed bracketed host
-        }
-    } else {
-        after_scheme
-            .split(['/', ':', '?', '#'])
-            .next()
-            .unwrap_or("")
+    let Some(host) = parsed.host_str() else {
+        return false;
     };
+    // IPv6 hosts come back bracketed; strip before parsing as an address.
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    match bare.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => is_public_ipv4(v4),
+        Ok(IpAddr::V6(v6)) => is_public_ipv6(v6),
+        Err(_) => is_public_hostname(host),
+    }
+}
 
-    if host.is_empty() {
-        return false;
-    }
+/// Hostname blocklist; a trailing root dot (`localhost.`) resolves identically so is ignored.
+fn is_public_hostname(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    !(host.is_empty()
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local"))
+}
 
-    // IPv6 private / non-routable ranges. `host` here is already unbracketed and lowercase.
-    // - ::1        loopback
-    // - fe80::/10  link-local  (fe80..febf)
-    // - fc00::/7   unique local (fc00..fdff)
-    // - ::ffff:x   IPv4-mapped — defer to the IPv4 rules below by unwrapping it
-    if host.contains(':') {
-        if let Some(v4) = host.rsplit_once(':').map(|(_, tail)| tail) {
-            // IPv4-mapped form like ::ffff:127.0.0.1 — re-check the embedded IPv4 literal.
-            if v4.contains('.') {
-                return is_safe_url(&format!("http://{v4}"));
-            }
-        }
-        let first_group = host.split(':').next().unwrap_or("");
-        let is_link_local = first_group.starts_with("fe8")
-            || first_group.starts_with("fe9")
-            || first_group.starts_with("fea")
-            || first_group.starts_with("feb");
-        let is_unique_local = first_group.starts_with("fc") || first_group.starts_with("fd");
-        if is_link_local || is_unique_local {
-            return false;
-        }
+/// IPv4: reject unspecified/"this network" (0/8), loopback, private, link-local (incl. cloud
+/// metadata 169.254.169.254), CGNAT (100.64/10), broadcast and multicast.
+fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    !(a == 0
+        || ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || (a == 100 && (64..=127).contains(&b))
+        || ip.is_broadcast()
+        || ip.is_multicast())
+}
+
+/// IPv6: an IPv4-mapped address (`::ffff:a.b.c.d`) is judged by its embedded IPv4 — that's what
+/// the socket reaches. Otherwise reject unspecified (`::`), loopback, link-local (fe80::/10),
+/// unique-local (fc00::/7) and multicast.
+fn is_public_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return is_public_ipv4(v4);
     }
-    // Block loopback, link-local, metadata, and common private ranges.
-    let blocked_exact = [
-        "localhost",
-        "127.0.0.1",
-        "0.0.0.0",
-        "::1",
-        "169.254.169.254",
-    ];
-    if blocked_exact.contains(&host) {
-        return false;
-    }
-    if host.starts_with("10.")
-        || host.starts_with("192.168.")
-        || host.starts_with("169.254.")
-        || host.ends_with(".local")
-    {
-        return false;
-    }
-    // 172.16.0.0/12
-    if let Some(rest) = host.strip_prefix("172.") {
-        if let Some(second) = rest.split('.').next() {
-            if let Ok(n) = second.parse::<u8>() {
-                if (16..=31).contains(&n) {
-                    return false;
-                }
-            }
-        }
-    }
-    // IPv4 100.64.0.0/10 (carrier-grade NAT)
-    if host.starts_with("100.") {
-        if let Some(rest) = host.strip_prefix("100.") {
-            if let Some(second) = rest.split('.').next() {
-                if let Ok(n) = second.parse::<u8>() {
-                    if (64..=127).contains(&n) {
-                        return false;
-                    }
-                }
-            }
-        }
-    }
-    // IPv6 checks (loopback, link-local, unique-local)
-    if host.contains(":") {
-        if host == "::1" || host == "::" {
-            return false;
-        }
-        if host.starts_with("fe80:") {
-            return false;
-        }
-        if host.starts_with("fc") || host.starts_with("fd") {
-            return false;
-        }
-    }
-    true
+    let first = ip.segments()[0];
+    !(ip.is_unspecified()
+        || ip.is_loopback()
+        || (first & 0xffc0) == 0xfe80
+        || (first & 0xfe00) == 0xfc00
+        || ip.is_multicast())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_safe_url;
+    use super::{is_safe_url, response_snippet, RESPONSE_SNIPPET_MAX_BYTES};
 
     #[test]
     fn allows_public_https() {
@@ -336,5 +379,57 @@ mod tests {
         assert!(!is_safe_url("http://[fc00::1]/hook"));
         assert!(!is_safe_url("http://[fd00::1]/hook"));
         assert!(!is_safe_url("http://100.64.5.5/x"));
+    }
+
+    #[test]
+    fn is_safe_url_rejects_ipv4_mapped_ipv6_loopback() {
+        assert!(!is_safe_url("http://[::ffff:127.0.0.1]/hook"));
+        // The hex spelling reqwest normalises to — previously slipped past the string check.
+        assert!(!is_safe_url("http://[::ffff:7f00:1]/hook"));
+        assert!(!is_safe_url("http://[::ffff:10.0.0.1]/hook"));
+        assert!(!is_safe_url("http://[::ffff:169.254.169.254]/latest/meta-data"));
+        assert!(!is_safe_url("http://[::ffff:a9fe:a9fe]/latest/meta-data"));
+    }
+
+    #[test]
+    fn is_safe_url_rejects_the_unspecified_address() {
+        assert!(!is_safe_url("http://0.0.0.0/hook"));
+        assert!(!is_safe_url("http://0.0.0.0:8080/hook"));
+        assert!(!is_safe_url("http://[::]/hook"));
+        assert!(!is_safe_url("http://[::ffff:0.0.0.0]/hook"));
+        // Shorthand forms the URL parser expands to 0.0.0.0 / 127.0.0.1.
+        assert!(!is_safe_url("http://0/hook"));
+        assert!(!is_safe_url("http://2130706433/hook"));
+        assert!(!is_safe_url("http://0x7f.1/hook"));
+    }
+
+    #[test]
+    fn is_safe_url_still_accepts_a_normal_public_https_url() {
+        assert!(is_safe_url("https://api.customer.com/webhooks"));
+        assert!(is_safe_url("https://8.8.8.8/hook"));
+        assert!(is_safe_url("https://[2606:4700:4700::1111]/hook"));
+        assert!(is_safe_url("https://[::ffff:8.8.8.8]/hook"));
+    }
+
+    #[test]
+    fn blocks_trailing_dot_localhost() {
+        assert!(!is_safe_url("http://localhost./hook"));
+    }
+
+    #[test]
+    fn response_snippet_redacts_secrets_and_caps_size() {
+        let body = format!("echo sig=abc123 secret=s3cr3t {}", "x".repeat(4096));
+        let snippet = response_snippet(body.as_bytes(), &["abc123", "s3cr3t"]).unwrap();
+        assert!(!snippet.contains("abc123") && !snippet.contains("s3cr3t"));
+        assert!(snippet.len() <= RESPONSE_SNIPPET_MAX_BYTES);
+        assert_eq!(response_snippet(b"", &["abc123"]), None);
+    }
+
+    #[test]
+    fn response_snippet_truncates_on_a_char_boundary() {
+        let body = "é".repeat(RESPONSE_SNIPPET_MAX_BYTES);
+        let snippet = response_snippet(body.as_bytes(), &[]).unwrap();
+        assert!(snippet.len() <= RESPONSE_SNIPPET_MAX_BYTES);
+        assert!(snippet.chars().all(|c| c == 'é'));
     }
 }

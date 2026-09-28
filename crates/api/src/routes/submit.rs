@@ -143,9 +143,10 @@ pub async fn relay_signed_transaction(
         ),
     };
 
-    // Record outbound payments in the history the dashboard lists (best-effort).
+    // Record outbound payments in the history the dashboard lists (best-effort). The store call
+    // is idempotent per tx hash, so `Ok(None)` (already recorded) is expected on a retry.
     if let Some(p) = &payment {
-        let _ = state
+        if let Err(e) = state
             .store()
             .record_withdrawal_transaction(
                 wallet_id,
@@ -157,7 +158,10 @@ pub async fn relay_signed_transaction(
                 hash.as_deref(),
                 status,
             )
-            .await;
+            .await
+        {
+            tracing::warn!(wallet = %wallet_id, error = ?e, "failed to record withdrawal history");
+        }
     }
 
     Ok(RelayOutcome {
@@ -437,4 +441,60 @@ pub struct SigningInfo {
     pub sequence: i64,
     pub network_passphrase: String,
     pub base_fee_stroops: i64,
+}
+
+const WITHDRAW_CONFIRM_RATE_LIMIT_THRESHOLD: u32 = 10;
+const WITHDRAW_CONFIRM_RATE_LIMIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(3600);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_amount_strips_trailing_zeros() {
+        assert_eq!(format_amount(1_000_000), "0.1");
+        assert_eq!(format_amount(10_000_000), "1");
+        assert_eq!(format_amount(100_000_000), "10");
+    }
+
+    #[test]
+    fn format_amount_handles_fractional_stroops() {
+        assert_eq!(format_amount(1), "0.0000001");
+        assert_eq!(format_amount(10), "0.000001");
+        assert_eq!(format_amount(100), "0.00001");
+    }
+
+    #[test]
+    fn format_amount_zero() {
+        assert_eq!(format_amount(0), "0");
+    }
+
+    #[test]
+    fn withdraw_confirm_rate_limit_threshold_is_reasonable() {
+        assert!(WITHDRAW_CONFIRM_RATE_LIMIT_THRESHOLD >= 5);
+        assert!(WITHDRAW_CONFIRM_RATE_LIMIT_THRESHOLD <= 20);
+    }
+
+    #[test]
+    fn withdraw_confirm_rate_limit_window_is_one_hour() {
+        assert_eq!(WITHDRAW_CONFIRM_RATE_LIMIT_WINDOW, std::time::Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn withdrawal_otp_ttl_is_ten_minutes() {
+        assert_eq!(WITHDRAW_OTP_TTL_MINUTES, 10);
+    }
+
+    #[test]
+    fn rate_limit_allows_reasonable_retry_count() {
+        assert!(WITHDRAW_CONFIRM_RATE_LIMIT_THRESHOLD > 2);
+    }
+
+    #[test]
+    fn explain_code_returns_human_readable_messages() {
+        assert!(!explain_code("op_underfunded").is_empty());
+        assert!(!explain_code("op_low_reserve").is_empty());
+        assert!(!explain_code("tx_bad_seq").is_empty());
+        assert!(!explain_code("unknown_code").contains("unknown_code"));
+    }
 }

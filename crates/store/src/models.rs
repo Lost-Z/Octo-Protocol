@@ -136,6 +136,8 @@ pub struct WebhookDelivery {
     pub status: String,
     pub attempts: i32,
     pub response_code: Option<i32>,
+    /// Truncated (≤ 1 KiB) response body from the last attempt; `None` if no response arrived.
+    pub response_body_snippet: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

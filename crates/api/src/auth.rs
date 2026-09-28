@@ -541,7 +541,12 @@ fn validate(creds: Credentials) -> Result<(String, String), ApiError> {
 
 /// 3–20 chars, ASCII letters/digits/underscore/hyphen only. Case is preserved for display;
 /// uniqueness is enforced case-insensitively by `users_username_unique_idx`.
+/// Reserved usernames are blocked case-insensitively to prevent impersonation.
 fn validate_username(input: Option<String>) -> Result<String, ApiError> {
+    const RESERVED_USERNAMES: &[&str] = &[
+        "admin", "root", "support", "official", "octo", "system", "me", "api",
+    ];
+
     let username = input
         .map(|u| u.trim().to_string())
         .filter(|u| !u.is_empty())
@@ -559,7 +564,29 @@ fn validate_username(input: Option<String>) -> Result<String, ApiError> {
             "username may only contain letters, numbers, underscores, and hyphens".into(),
         ));
     }
+    if RESERVED_USERNAMES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(&username))
+    {
+        return Err(ApiError::BadRequest(
+            "this username is not available".into(),
+        ));
+    }
     Ok(username)
+}
+
+/// Validate that JWT_SECRET meets the minimum length requirement.
+/// HMAC-SHA256 silently accepts secrets of any length, but a short secret
+/// enables trivial token forgery. This enforces a 32-byte minimum at startup.
+pub fn validate_jwt_secret(secret: &[u8]) -> Result<(), String> {
+    const MIN_LENGTH: usize = 32;
+    if secret.len() < MIN_LENGTH {
+        return Err(format!(
+            "JWT_SECRET must be at least {MIN_LENGTH} bytes, got {}",
+            secret.len()
+        ));
+    }
+    Ok(())
 }
 
 fn hash_password(password: &str) -> Result<String, ApiError> {
@@ -867,5 +894,209 @@ mod tests {
         assert!(verify_token(SECRET, &tampered).is_none());
 
         assert!(verify_token(SECRET, &token).is_some());
+    }
+
+    #[test]
+    fn validate_jwt_secret_rejects_empty_secret() {
+        let result = validate_jwt_secret(&[]);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_lowercase()
+            .contains("minimum length"));
+    }
+
+    #[test]
+    fn validate_jwt_secret_rejects_secret_under_32_bytes() {
+        let result = validate_jwt_secret(b"too-short");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_lowercase()
+            .contains("minimum length"));
+
+        let result = validate_jwt_secret(b"31-byte-secret-still-too-shor");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_jwt_secret_accepts_32_byte_secret() {
+        let result = validate_jwt_secret(b"exactly-32-byte-secret-for-hmac");
+        assert!(result.is_ok());
+
+        let result = validate_jwt_secret(b"more-than-32-bytes-is-also-fine!!");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn update_username_rejects_reserved_names() {
+        let reserved = ["admin", "root", "support", "official", "octo", "system", "me", "api"];
+        for name in reserved.iter() {
+            let result = validate_username(Some(name.to_string()));
+            assert!(
+                result.is_err(),
+                "validate_username should reject reserved name: {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn update_username_still_accepts_valid_non_reserved_names() {
+        let valid = ["alice", "bob123", "user_name", "test-user"];
+        for name in valid.iter() {
+            let result = validate_username(Some(name.to_string()));
+            assert!(
+                result.is_ok(),
+                "validate_username should accept valid name: {}",
+                name
+            );
+            assert_eq!(result.unwrap(), *name);
+        }
+    }
+
+    #[test]
+    fn update_username_reserved_check_is_case_insensitive() {
+        let result = validate_username(Some("AdMiN".to_string()));
+        assert!(result.is_err());
+
+        let result = validate_username(Some("SUPPORT".to_string()));
+        assert!(result.is_err());
+
+        let result = validate_username(Some("Root".to_string()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_credentials_rejects_short_password() {
+        let creds = Credentials {
+            email: Some("test@example.com".to_string()),
+            password: Some("short".to_string()),
+        };
+        let result = validate(creds);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .message
+            .to_lowercase()
+            .contains("password must be"));
+    }
+
+    #[test]
+    fn validate_credentials_accepts_8_char_password() {
+        let creds = Credentials {
+            email: Some("test@example.com".to_string()),
+            password: Some("12345678".to_string()),
+        };
+        let result = validate(creds);
+        assert!(result.is_ok());
+        let (email, password) = result.unwrap();
+        assert_eq!(email, "test@example.com");
+        assert_eq!(password, "12345678");
+    }
+
+    #[test]
+    fn validate_credentials_requires_valid_email() {
+        let creds = Credentials {
+            email: Some("invalid-email".to_string()),
+            password: Some("validpassword".to_string()),
+        };
+        let result = validate(creds);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .message
+            .to_lowercase()
+            .contains("valid email"));
+
+        let creds = Credentials {
+            email: Some("a@b".to_string()),
+            password: Some("validpassword".to_string()),
+        };
+        let result = validate(creds);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn token_includes_unique_jti_to_prevent_collision() {
+        let user_id = Uuid::new_v4();
+        let token1 = issue_token(SECRET, user_id).expect("issue_token should succeed");
+        let token2 = issue_token(SECRET, user_id).expect("issue_token should succeed");
+
+        assert_ne!(token1, token2, "tokens for same user issued in quick succession should differ");
+
+        let claims1 = verify_token(SECRET, &token1).expect("token1 should verify");
+        let claims2 = verify_token(SECRET, &token2).expect("token2 should verify");
+        assert_ne!(
+            claims1.jti, claims2.jti,
+            "each token should have a unique jti"
+        );
+        assert_eq!(
+            claims1.sub, claims2.sub,
+            "but both should be for the same user"
+        );
+    }
+
+    #[test]
+    fn token_expires_after_ttl() {
+        let user_id = Uuid::new_v4();
+        let token = issue_token(SECRET, user_id).expect("issue_token should succeed");
+        let claims = verify_token(SECRET, &token).expect("token should verify");
+
+        let now = now_secs();
+        let ttl_secs = claims.exp - now;
+
+        assert!(ttl_secs > 0, "token should have positive TTL");
+        assert!(
+            ttl_secs >= 7 * 24 * 60 * 60 - 1 && ttl_secs <= 7 * 24 * 60 * 60 + 1,
+            "token TTL should be 7 days (within ±1 second for timing variance)"
+        );
+    }
+
+    #[test]
+    fn hash_token_produces_consistent_output() {
+        let token = "test.jwt.token";
+        let hash1 = hash_token(token);
+        let hash2 = hash_token(token);
+
+        assert_eq!(
+            hash1, hash2,
+            "hashing the same token should produce the same hash"
+        );
+        assert_eq!(
+            hash1.len(),
+            64,
+            "SHA-256 hex should be 64 characters"
+        );
+    }
+
+    #[test]
+    fn different_tokens_produce_different_hashes() {
+        let token1 = "test.jwt.token1";
+        let token2 = "test.jwt.token2";
+        let hash1 = hash_token(token1);
+        let hash2 = hash_token(token2);
+
+        assert_ne!(
+            hash1, hash2,
+            "different tokens should produce different hashes"
+        );
+    }
+
+    #[test]
+    fn verify_token_rejects_malformed_tokens() {
+        assert!(verify_token(SECRET, "").is_none());
+        assert!(verify_token(SECRET, "not.a.token").is_none());
+        assert!(verify_token(SECRET, "a.b").is_none());
+        assert!(verify_token(SECRET, "a.b.c.d").is_none());
+    }
+
+    #[test]
+    fn verify_token_rejects_tokens_signed_with_different_secret() {
+        let user_id = Uuid::new_v4();
+        let token = issue_token(SECRET, user_id).expect("issue_token should succeed");
+
+        let other_secret = b"different-secret-at-least-32-bytes-long!";
+        assert!(verify_token(other_secret, &token).is_none());
     }
 }

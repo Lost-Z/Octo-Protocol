@@ -853,11 +853,12 @@ async fn regenerating_api_key_invalidates_the_previous_one() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    // Regenerate: POST again with the (dashboard) owner token.
+    // Regenerate: POST again with the (dashboard) owner token, explicitly confirming rotation.
     let resp = app
         .clone()
-        .oneshot(post_auth(
+        .oneshot(post_json_auth(
             &format!("/v1/wallets/{wallet_id_str}/api-key"),
+            r#"{"confirm":true}"#,
             &token,
         ))
         .await
@@ -2642,4 +2643,46 @@ async fn submit_payment_validates_against_the_intents_own_address() {
         StatusCode::CREATED,
         "a USDC payment to this intent's own address must pass validation and be relayed"
     );
+}
+
+#[tokio::test]
+async fn list_deliveries_response_includes_the_new_diagnostic_fields() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL to run integration tests");
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+    let wallet_id: uuid::Uuid = create_wallet_for(&app, &token).await.parse().unwrap();
+
+    // Seed a failed delivery directly: this test covers the read path, not dispatch.
+    let ep = state
+        .store()
+        .create_webhook_endpoint(wallet_id, "https://merchant.example/hook", "s")
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        state
+            .store()
+            .log_webhook_delivery(
+                ep.id,
+                "deposit.created",
+                &serde_json::json!({}),
+                "failed",
+                3,
+                Some(503),
+                Some("upstream unavailable"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let uri = format!("/v1/wallets/{wallet_id}/webhooks/{}/deliveries?limit=1", ep.id);
+    let resp = app.oneshot(get_auth(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rows = body_json(resp).await["data"].as_array().unwrap().clone();
+    assert_eq!(rows.len(), 1, "?limit= must be honoured");
+    assert_eq!(rows[0]["response_code"], 503);
+    assert_eq!(rows[0]["response_body_snippet"], "upstream unavailable");
+    assert_eq!(rows[0]["attempts"], 3);
 }

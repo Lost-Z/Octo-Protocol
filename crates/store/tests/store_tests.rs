@@ -758,7 +758,7 @@ async fn sum_fees_today_can_use_wallet_status_created_at_index() {
            FROM sponsored_transactions
            WHERE wallet_id = $1
              AND status = 'confirmed'
-             AND created_at >= date_trunc('day', now() AT TIME ZONE 'UTC')"#,
+             AND created_at >= date_trunc('day', now(), 'UTC')"#,
     )
     .bind(wallet_id)
     .fetch_all(&mut *tx)

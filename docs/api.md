@@ -97,18 +97,24 @@ carries fee float only — the one server-held key in the system, bounded by you
 - `DELETE /v1/wallets/{id}/webhooks/{endpoint_id}` — deactivate (soft delete, so the delivery
   history survives as an audit trail).
 - `GET    /v1/wallets/{id}/webhooks/{endpoint_id}/deliveries` — delivery history (`?limit=`,
-  default 50, max 200).
+  default 50, max 200). Each row carries `response_code` (HTTP status of the last attempt, `null` on
+  a connection error/timeout) and `response_body_snippet` (first ≤ 1 KiB of the response body, with
+  the signature and secret redacted). Transport errors and 5xx are retried with backoff (3 attempts,
+  20 s ceiling); other non-2xx responses are not retried.
 
 Deliveries are signed `HMAC-SHA256` over the raw body. Endpoint URLs are SSRF-screened:
-loopback, private and link-local targets are rejected, IPv4 and bracketed IPv6 alike.
+loopback, private and link-local targets are rejected, IPv4 and bracketed IPv6 alike —
+including IPv4-mapped IPv6 (`[::ffff:127.0.0.1]`) and the unspecified address (`0.0.0.0`, `[::]`).
 
 ## API keys
 
 All three require a **dashboard JWT** and wallet ownership — an API key can never manage keys,
 so it cannot escalate or revoke itself.
 
-- `POST   /v1/wallets/{id}/api-key` — generate/regenerate (the plaintext key is shown **once**;
-  only a SHA-256 hash is stored).
+- `POST   /v1/wallets/{id}/api-key` — generate (the plaintext key is shown **once**; only a
+  SHA-256 hash is stored). The first key needs no body. Once a key exists, rotating it requires
+  `{"confirm": true}` — otherwise `409` ("an API key already exists; pass confirm=true to rotate
+  it"). Rotation immediately invalidates the previous key.
 - `GET    /v1/wallets/{id}/api-key` — metadata (prefix, created_at) — never the key itself.
 - `DELETE /v1/wallets/{id}/api-key` — revoke.
 

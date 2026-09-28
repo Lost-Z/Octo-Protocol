@@ -91,6 +91,8 @@ pub struct WebhookDeliveryView {
     pub status: String,
     pub attempts: i32,
     pub response_code: Option<i32>,
+    /// First ≤ 1 KiB of the endpoint's last response body, for self-service diagnosis.
+    pub response_body_snippet: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -174,10 +176,10 @@ pub async fn list_deliveries(
         return Err(ApiError::NotFound);
     }
 
-    // Retrieve deliveries (limit to last 50).
+    // Honour the validated `?limit=` (previously ignored in favour of a hardcoded 50).
     let deliveries = state
         .store()
-        .list_webhook_deliveries(endpoint_id, 50)
+        .list_webhook_deliveries(endpoint_id, limit)
         .await?;
 
     let views: Vec<WebhookDeliveryView> = deliveries
@@ -190,6 +192,7 @@ pub async fn list_deliveries(
             status: d.status,
             attempts: d.attempts,
             response_code: d.response_code,
+            response_body_snippet: d.response_body_snippet,
             created_at: d.created_at,
             updated_at: d.updated_at,
         })

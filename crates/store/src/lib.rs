@@ -10,6 +10,9 @@
 //! - [`Store::record_deposit`] is **idempotent** on the immutable `(tx_hash, operation_index)`
 //!   unique index, so a replayed/reorged Horizon event cannot double-credit.
 //! - [`Store::create_withdrawal`] is idempotent on `(wallet_id, idempotency_key)`.
+//! - Every `list_*` method clamps its `limit` to [`MAX_LIST_LIMIT`]. This is defense in depth
+//!   *beneath* the API layer's own validation (max 200), not a replacement for it: it only stops a
+//!   caller that bypasses the API (an internal tool, a script) from issuing an unbounded query.
 #![forbid(unsafe_code)]
 
 mod error;
@@ -28,6 +31,14 @@ use uuid::Uuid;
 
 /// Embedded migrations, applied by [`Store::migrate`].
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// Hard ceiling on any list query's `LIMIT`, well above the API's max page (200 + 1 look-ahead).
+pub const MAX_LIST_LIMIT: i64 = 1000;
+
+/// Clamp a caller-supplied `limit` into `0..=MAX_LIST_LIMIT` (a negative LIMIT is a SQL error).
+fn clamp_limit(limit: i64) -> i64 {
+    limit.clamp(0, MAX_LIST_LIMIT)
+}
 
 /// A handle to the database (cloneable; wraps a connection pool).
 #[derive(Clone)]
@@ -303,6 +314,7 @@ impl Store {
         search: Option<&str>,
         limit: i64,
     ) -> Result<Vec<AuditLog>, StoreError> {
+        let limit = clamp_limit(limit);
         // Build with optional filters; `$2`/`$3` are NULL when not provided.
         let rows = sqlx::query_as::<_, AuditLog>(
             r#"
@@ -325,6 +337,26 @@ impl Store {
     }
 
     // --- api keys ---------------------------------------------------------
+
+    /// Create the wallet's first API key. Stores only the hash + display prefix. Atomic on the
+    /// `wallet_id` unique key: [`StoreError::Conflict`] if one already exists, so a racing or
+    /// retried "create" can never silently rotate a live key — use [`Store::upsert_api_key`].
+    pub async fn create_api_key(
+        &self,
+        wallet_id: Uuid,
+        prefix: &str,
+        key_hash: &str,
+    ) -> Result<ApiKey, StoreError> {
+        sqlx::query_as::<_, ApiKey>(
+            "INSERT INTO api_keys (wallet_id, prefix, key_hash) VALUES ($1, $2, $3) RETURNING *",
+        )
+        .bind(wallet_id)
+        .bind(prefix)
+        .bind(key_hash)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(StoreError::from_sqlx_conflict)
+    }
 
     /// Create or replace the wallet's API key (regenerate). Stores only the hash + display prefix.
     pub async fn upsert_api_key(
@@ -475,6 +507,7 @@ impl Store {
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<Wallet>, StoreError> {
+        let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, Wallet>(
             r#"
             SELECT * FROM wallets
@@ -502,6 +535,7 @@ impl Store {
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<Wallet>, StoreError> {
+        let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, Wallet>(
             r#"
             SELECT * FROM wallets
@@ -521,11 +555,35 @@ impl Store {
         Ok(rows)
     }
 
-    /// List all wallets (used by the ingest supervisor to fan out poll loops).
+    /// List all wallets in one unbounded query. Kept for tests and tooling; the ingest supervisor
+    /// pages through [`Store::wallets_due_for_poll_page`] instead.
     pub async fn list_wallets(&self) -> Result<Vec<Wallet>, StoreError> {
         let rows = sqlx::query_as::<_, Wallet>("SELECT * FROM wallets ORDER BY created_at")
             .fetch_all(&self.pool)
             .await?;
+        Ok(rows)
+    }
+
+    /// One keyset page of all wallets, ordered by `id`. Pass the last row's id as `after_id` to
+    /// fetch the next page; an empty (or short) page means the end was reached. Ordering by the
+    /// unique primary key keeps pages free of gaps and duplicates.
+    pub async fn list_wallets_page(
+        &self,
+        limit: i64,
+        after_id: Option<Uuid>,
+    ) -> Result<Vec<Wallet>, StoreError> {
+        let rows = sqlx::query_as::<_, Wallet>(
+            r#"
+            SELECT * FROM wallets
+            WHERE ($1::uuid IS NULL OR id > $1)
+            ORDER BY id
+            LIMIT $2
+            "#,
+        )
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows)
     }
 
@@ -542,6 +600,8 @@ impl Store {
     ///   `dormant_interval_secs`
     ///
     /// A wallet with no cursor row has never been polled, so it is always due.
+    ///
+    /// Unbounded; prefer [`Store::wallets_due_for_poll_page`] when the wallet count can be large.
     pub async fn wallets_due_for_poll(
         &self,
         network: &str,
@@ -550,11 +610,40 @@ impl Store {
         dormant_after_secs: i64,
         dormant_interval_secs: i64,
     ) -> Result<Vec<Wallet>, StoreError> {
+        // `LIMIT NULL` is "no limit" in Postgres, so this is the paged query's full result.
+        self.wallets_due_for_poll_page(
+            network,
+            active_after_secs,
+            idle_interval_secs,
+            dormant_after_secs,
+            dormant_interval_secs,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// One keyset page of [`Store::wallets_due_for_poll`], ordered by `id`, with the exact same
+    /// backoff filter. Pass the last row's id as `after_id` for the next page; `limit = None`
+    /// returns everything. Paging on the unique primary key means no wallet is skipped or
+    /// returned twice across page boundaries within one pass.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn wallets_due_for_poll_page(
+        &self,
+        network: &str,
+        active_after_secs: i64,
+        idle_interval_secs: i64,
+        dormant_after_secs: i64,
+        dormant_interval_secs: i64,
+        limit: Option<i64>,
+        after_id: Option<Uuid>,
+    ) -> Result<Vec<Wallet>, StoreError> {
         let rows = sqlx::query_as::<_, Wallet>(
             r#"
             SELECT w.* FROM wallets w
             LEFT JOIN ingest_cursor c ON c.wallet_id = w.id
             WHERE w.network = $1
+              AND ($6::uuid IS NULL OR w.id > $6)
               -- Never polled, or never saw activity => always due.
               AND (
                 c.last_polled_at IS NULL
@@ -569,7 +658,8 @@ impl Store {
                        ELSE $3
                      END)
               )
-            ORDER BY w.created_at
+            ORDER BY w.id
+            LIMIT $7
             "#,
         )
         .bind(network)
@@ -577,6 +667,8 @@ impl Store {
         .bind(idle_interval_secs as f64)
         .bind(dormant_after_secs as f64)
         .bind(dormant_interval_secs as f64)
+        .bind(after_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
@@ -668,6 +760,7 @@ impl Store {
         batch_size: i64,
         after_id: Option<Uuid>,
     ) -> Result<Vec<Wallet>, StoreError> {
+        let batch_size = clamp_limit(batch_size);
         let rows = sqlx::query_as::<_, Wallet>(
             r#"
             SELECT * FROM wallets
@@ -743,6 +836,7 @@ impl Store {
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<Address>, StoreError> {
+        let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, Address>(
             r#"
             SELECT * FROM addresses
@@ -770,6 +864,7 @@ impl Store {
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<Address>, StoreError> {
+        let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, Address>(
             r#"
             SELECT * FROM addresses
@@ -863,6 +958,7 @@ impl Store {
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<Transaction>, StoreError> {
+        let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, Transaction>(
             r#"
             SELECT * FROM transactions
@@ -890,6 +986,7 @@ impl Store {
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<Transaction>, StoreError> {
+        let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, Transaction>(
             r#"
             SELECT * FROM transactions
@@ -938,11 +1035,16 @@ impl Store {
         Ok(found.is_some())
     }
 
-    /// Create a withdrawal intent. Idempotent on `(wallet_id, idempotency_key)`: a retried request
-    /// with the same key returns [`StoreError::Conflict`] instead of creating a second payout.
     /// Record a confirmed/failed outbound transfer in the `transactions` history (the table the
     /// dashboard lists). Withdrawals previously lived only in `withdrawals`, which is why they
     /// never showed up in "recent transactions".
+    ///
+    /// Idempotent on `(wallet_id, stellar_tx_hash)` (migration `0021`), matching
+    /// [`Store::record_deposit`]: returns `Ok(Some(tx))` when a row is inserted and `Ok(None)` when
+    /// this transfer is already recorded, so a retried status update can't double-list a payout.
+    /// The one exception is a retry that turns an earlier `failed` row into `confirmed` (e.g. the
+    /// first submit timed out but the same signed XDR later landed): that row is upgraded in place
+    /// and returned. A `confirmed` row is never downgraded.
     #[allow(clippy::too_many_arguments)]
     pub async fn record_withdrawal_transaction(
         &self,
@@ -954,13 +1056,18 @@ impl Store {
         destination_account: &str,
         stellar_tx_hash: Option<&str>,
         status: &str,
-    ) -> Result<Transaction, StoreError> {
+    ) -> Result<Option<Transaction>, StoreError> {
+        // No row back means the conflict fired and the existing row was left as-is.
         let row = sqlx::query_as::<_, Transaction>(
             r#"
             INSERT INTO transactions
                 (wallet_id, direction, asset_code, asset_issuer, amount_stroops,
                  source_account, destination_account, stellar_tx_hash, status)
             VALUES ($1, 'withdrawal', $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (wallet_id, stellar_tx_hash)
+                WHERE stellar_tx_hash IS NOT NULL AND direction = 'withdrawal'
+            DO UPDATE SET status = EXCLUDED.status
+                WHERE transactions.status <> 'confirmed' AND EXCLUDED.status = 'confirmed'
             RETURNING *
             "#,
         )
@@ -972,11 +1079,13 @@ impl Store {
         .bind(destination_account)
         .bind(stellar_tx_hash)
         .bind(status)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
         Ok(row)
     }
 
+    /// Create a withdrawal intent. Idempotent on `(wallet_id, idempotency_key)`: a retried request
+    /// with the same key returns [`StoreError::Conflict`] instead of creating a second payout.
     pub async fn create_withdrawal(
         &self,
         new: NewWithdrawal<'_>,
@@ -1031,6 +1140,7 @@ impl Store {
         status_filter: Option<&str>,
         before_id: Option<Uuid>,
     ) -> Result<Vec<SponsoredTransaction>, StoreError> {
+        let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, SponsoredTransaction>(
             r#"
             SELECT * FROM sponsored_transactions
@@ -1108,7 +1218,7 @@ impl Store {
             FROM sponsored_transactions
             WHERE wallet_id = $1
               AND status IN ('pending', 'confirmed')
-              AND created_at >= date_trunc('day', now() AT TIME ZONE 'UTC')
+              AND created_at >= date_trunc('day', now(), 'UTC')
             "#,
         )
         .bind(wallet_id)
@@ -1158,6 +1268,12 @@ impl Store {
     }
 
     /// Add an address to a wallet's withdrawal allowlist. `Conflict` if already present.
+    ///
+    /// Format validation is the **caller's** responsibility: `address` must already be a valid,
+    /// normalized base `G...` account (the API does this via `octo_wallet_core::to_base_account`).
+    /// The store stays free of Stellar-specific parsing, and an unvalidated or `M...` entry would
+    /// never match the normalized destination checked by [`Store::is_address_whitelisted`] —
+    /// an allowlist that accepts anything protects nothing.
     pub async fn add_whitelisted_address(
         &self,
         wallet_id: Uuid,
@@ -1274,7 +1390,8 @@ impl Store {
 
     // --- payment links -------------------------------------------------------
 
-    /// Create a payment link backed by an already-allocated deposit address.
+    /// Create a payment link backed by an already-allocated deposit address. The slug is stored
+    /// lowercased; [`StoreError::Conflict`] if it collides case-insensitively with an existing one.
     pub async fn create_payment_link(
         &self,
         link: NewPaymentLink<'_>,
@@ -1283,7 +1400,7 @@ impl Store {
             r#"
             INSERT INTO payment_links
                 (wallet_id, address_id, slug, name, description, image_url, redirect_url, amount_usdc_stroops)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            VALUES ($1, $2, lower($3), $4, $5, $6, $7, $8)
             RETURNING *
             "#,
         )
@@ -1317,13 +1434,16 @@ impl Store {
         .ok_or(StoreError::NotFound)
     }
 
-    /// Public lookup by slug — no wallet scoping, this is the pay-page entry point.
+    /// Public lookup by slug — no wallet scoping, this is the pay-page entry point. Matches
+    /// case-insensitively (via the `lower(slug)` unique index), since users treat URLs that way.
     pub async fn get_payment_link_by_slug(&self, slug: &str) -> Result<PaymentLink, StoreError> {
-        sqlx::query_as::<_, PaymentLink>("SELECT * FROM payment_links WHERE slug = $1")
-            .bind(slug)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or(StoreError::NotFound)
+        sqlx::query_as::<_, PaymentLink>(
+            "SELECT * FROM payment_links WHERE lower(slug) = lower($1)",
+        )
+        .bind(slug)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)
     }
 
     /// Unscoped lookup by id — for internal (non-owner-facing) callers that already know which
@@ -1358,6 +1478,7 @@ impl Store {
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<PaymentLink>, StoreError> {
+        let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, PaymentLink>(
             r#"
             SELECT * FROM payment_links
@@ -1478,40 +1599,50 @@ impl Store {
         Ok(row)
     }
 
+    /// Transition a payment from `pending` to `confirmed`, linking the matched deposit.
+    ///
+    /// **Idempotent:** guarded by `status = 'pending'`, so a repeat call (a reprocessed deposit, a
+    /// retry after a timeout, or a race with the expiry sweep) is a no-op rather than an error.
+    /// Returns `true` only when this call actually flipped the row — callers must dispatch the
+    /// `payment_link.paid` webhook only on `true`, so it fires at most once per payment.
     pub async fn confirm_payment_link_payment(
         &self,
         id: Uuid,
         transaction_id: Uuid,
-    ) -> Result<(), StoreError> {
-        sqlx::query(
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
             r#"
             UPDATE payment_link_payments
             SET status = 'confirmed', transaction_id = $1
-            WHERE id = $2
+            WHERE id = $2 AND status = 'pending'
             "#,
         )
         .bind(transaction_id)
         .bind(id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     /// Record a deposit that landed on this payment's address but for the wrong amount.
     /// `status` must be `"underpaid"` or `"overpaid"` — the transaction is still linked (so the
     /// merchant/payer can see what actually arrived) but the payment is deliberately NOT marked
     /// `confirmed`.
+    ///
+    /// Same `status = 'pending'` idempotency guard as [`Store::confirm_payment_link_payment`]:
+    /// returns `true` only when this call flipped the row, so the mismatch webhook fires once and
+    /// a late deposit can't overwrite an already-settled payment.
     pub async fn mark_payment_link_payment_mismatched(
         &self,
         id: Uuid,
         transaction_id: Uuid,
         status: &str,
-    ) -> Result<(), StoreError> {
-        sqlx::query(
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
             r#"
             UPDATE payment_link_payments
             SET status = $1, transaction_id = $2
-            WHERE id = $3
+            WHERE id = $3 AND status = 'pending'
             "#,
         )
         .bind(status)
@@ -1519,7 +1650,7 @@ impl Store {
         .bind(id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     /// Mark payments still `pending` past a 1-hour deadline as `expired`, returning the rows that
@@ -1550,6 +1681,7 @@ impl Store {
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<PaymentLinkPayment>, StoreError> {
+        let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, PaymentLinkPayment>(
             r#"
             SELECT * FROM payment_link_payments
@@ -1618,6 +1750,26 @@ impl Store {
     /// statement (a conditional CTE), so concurrent sponsorships can't oversubscribe the budget.
     /// Returns `StoreError::BudgetExceeded` if the budget would be exceeded, or
     /// `StoreError::Conflict` if this `inner_tx_hash` was already sponsored (double-submit).
+    ///
+    /// # Locking strategy
+    ///
+    /// The budget sum and the insert run in one transaction that first takes a `FOR NO KEY UPDATE`
+    /// row lock on the wallet's `wallets` row. A conditional CTE alone is not enough: under READ
+    /// COMMITTED every concurrent request would compute `spent` from a snapshot that can't see the
+    /// others' uncommitted inserts, so N requests near the ceiling could all pass the guard. The
+    /// row lock serializes check-and-insert per wallet (other wallets stay fully parallel), and
+    /// because the sum runs *after* the lock is granted it sees every reservation committed before.
+    /// `NO KEY` strength doesn't block the `FOR KEY SHARE` locks that foreign-key inserts (deposits,
+    /// addresses) take on the same row.
+    ///
+    /// # Day boundary
+    ///
+    /// "Today" is `date_trunc('day', now(), 'UTC')`, which is pinned to UTC regardless of the
+    /// session `TimeZone`. `now()` is the transaction start time and also becomes the row's
+    /// `created_at`, so every reservation is counted against exactly the UTC day it is stamped
+    /// with. A request that began before midnight but waited on the lock past it is still booked
+    /// (and checked) against the earlier day, and its sum has no upper bound, so it over-counts
+    /// rather than under-counts — neither day's budget can be exceeded.
     pub async fn try_reserve_sponsored_transaction(
         &self,
         wallet_id: Uuid,
@@ -1643,18 +1795,32 @@ impl Store {
         // A transaction-scoped advisory lock keyed on the wallet id makes the check-and-insert
         // mutually exclusive for that wallet, while leaving other wallets fully parallel. The
         // lock is released automatically when the transaction commits or rolls back.
+
         let mut tx = self.pool.begin().await?;
 
-        // Fold the wallet UUID into a stable i64 lock key.
-        let lock_key = {
-            let b = wallet_id.as_bytes();
-            i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-                ^ i64::from_be_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]])
-        };
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(lock_key)
-            .execute(&mut *tx)
-            .await?;
+        // Per-wallet serialization point; released on commit/rollback.
+        let locked: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM wallets WHERE id = $1 FOR NO KEY UPDATE")
+                .bind(wallet_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if locked.is_none() {
+            return Err(StoreError::NotFound);
+        }
+
+        let result = sqlx::query_as::<_, SponsoredTransaction>(
+
+        let mut tx = self.pool.begin().await?;
+
+        // Per-wallet serialization point; released on commit/rollback.
+        let locked: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM wallets WHERE id = $1 FOR NO KEY UPDATE")
+                .bind(wallet_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if locked.is_none() {
+            return Err(StoreError::NotFound);
+        }
 
         let result = sqlx::query_as::<_, SponsoredTransaction>(
             r#"
@@ -1663,7 +1829,7 @@ impl Store {
                 FROM sponsored_transactions
                 WHERE wallet_id = $1
                   AND status IN ('pending', 'confirmed')
-                  AND created_at >= date_trunc('day', now() AT TIME ZONE 'UTC')
+                  AND created_at >= date_trunc('day', now(), 'UTC')
             )
             INSERT INTO sponsored_transactions (wallet_id, inner_tx_hash, fee_stroops, status)
             SELECT $1, $2, $3, 'pending'
@@ -1758,7 +1924,7 @@ impl Store {
             FROM sponsored_transactions
             WHERE wallet_id = $1
               AND status = 'confirmed'
-              AND created_at >= date_trunc('day', now() AT TIME ZONE 'UTC')
+              AND created_at >= date_trunc('day', now(), 'UTC')
             "#,
         )
         .bind(wallet_id)
@@ -1906,6 +2072,7 @@ impl Store {
         endpoint_id: Uuid,
         limit: i64,
     ) -> Result<Vec<WebhookDelivery>, StoreError> {
+        let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, WebhookDelivery>(
             r#"
             SELECT * FROM webhook_deliveries
@@ -1930,12 +2097,14 @@ impl Store {
         status: &str,
         attempts: i32,
         response_code: Option<i32>,
+        response_body_snippet: Option<&str>,
     ) -> Result<Uuid, StoreError> {
         let id: Uuid = sqlx::query_scalar(
             r#"
             INSERT INTO webhook_deliveries
-                (endpoint_id, event_type, payload, status, attempts, response_code)
-            VALUES ($1, $2, $3, $4, $5, $6)
+                (endpoint_id, event_type, payload, status, attempts, response_code,
+                 response_body_snippet)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING id
             "#,
         )
@@ -1945,6 +2114,7 @@ impl Store {
         .bind(status)
         .bind(attempts)
         .bind(response_code)
+        .bind(response_body_snippet)
         .fetch_one(&self.pool)
         .await?;
         Ok(id)
