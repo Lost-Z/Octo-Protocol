@@ -6,14 +6,24 @@
 
 use crate::auth::authenticate;
 use crate::error::{ApiError, ApiResult, Envelope};
+use crate::json::parse_optional;
 use crate::state::AppState;
+use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use rand::RngCore;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+/// Optional body for `generate_key`. An empty body is valid for first-time generation.
+#[derive(Debug, Default, Deserialize)]
+pub struct GenerateKeyRequest {
+    /// Must be `true` to rotate an existing key (which immediately invalidates the old one).
+    #[serde(default)]
+    pub confirm: Option<bool>,
+}
 
 /// Returned once when a key is generated — includes the full secret.
 #[derive(Debug, Serialize)]
@@ -54,13 +64,18 @@ fn hash_key(key: &str) -> String {
     hex::encode(h.finalize())
 }
 
-/// `POST /v1/wallets/:id/api-key` — generate (or regenerate) the wallet's API key.
+/// `POST /v1/wallets/:id/api-key` — generate the wallet's API key, or rotate it with
+/// `{"confirm": true}`. Without confirmation an existing key is never replaced (409), so a
+/// double-click or retried request can't silently break every integration using the old key.
 pub async fn generate_key(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
+    body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Envelope<GeneratedKey>>)> {
     let wallet = owned_wallet(&state, &headers, id).await?;
+    let req: GenerateKeyRequest = parse_optional(&body)?;
+    let rotate = req.confirm == Some(true);
 
     // octo_sk_<network>_<32 hex chars>
     let mut raw = [0u8; 16];
@@ -74,17 +89,32 @@ pub async fn generate_key(
     // Display prefix: scheme + first 4 random chars.
     let prefix = format!("octo_sk_{net}_{}", &hex::encode(raw)[..4]);
 
-    state
-        .store()
-        .upsert_api_key(id, &prefix, &hash_key(&api_key))
-        .await
-        .map_err(|_| ApiError::Internal)?;
+    // Insert-only unless rotation is confirmed: atomic on wallet_id, so no check-then-write race.
+    let (store, key_hash) = (state.store(), hash_key(&api_key));
+    let stored = if rotate {
+        store.upsert_api_key(id, &prefix, &key_hash).await
+    } else {
+        store.create_api_key(id, &prefix, &key_hash).await
+    };
+    match stored {
+        Ok(_) => {}
+        Err(octo_store::StoreError::Conflict) => {
+            return Err(ApiError::ConflictWith(
+                "an API key already exists; pass confirm=true to rotate it".into(),
+            ))
+        }
+        Err(_) => return Err(ApiError::Internal),
+    }
 
     if let Some(uid) = wallet.user_id {
         crate::audit::record(
             &state,
             uid,
-            "generated an API key",
+            if rotate {
+                "rotated an API key"
+            } else {
+                "generated an API key"
+            },
             crate::audit::category::CREDENTIALS,
             wallet.label.as_deref(),
             &headers,

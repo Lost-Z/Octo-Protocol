@@ -16,6 +16,8 @@ pub mod category {
     pub const WEBHOOK: &str = "configuration";
     pub const WITHDRAWAL: &str = "wallet";
     pub const SPONSORSHIP: &str = "sponsorship";
+
+    pub const ALL: &[&str] = &[AUTH, WALLET, ADDRESS, CREDENTIALS, WEBHOOK, SPONSORSHIP];
 }
 
 /// Best-effort client IP from common proxy headers (first `X-Forwarded-For`, then `X-Real-IP`).

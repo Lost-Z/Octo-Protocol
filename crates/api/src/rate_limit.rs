@@ -12,6 +12,24 @@ use std::time::{Duration, Instant};
 /// Cap on tracked (ip, class) buckets before expired entries are swept.
 const SWEEP_THRESHOLD: usize = 10_000;
 
+// Rate limit thresholds and fixed windows for API endpoints.
+pub const AUTH_RATE_LIMIT: u32 = 10;
+pub const AUTH_RATE_WINDOW: Duration = Duration::from_secs(60);
+pub const OTP_RESEND_USER_LIMIT: u32 = 3;
+pub const OTP_RESEND_USER_WINDOW: Duration = Duration::from_secs(3600);
+pub const OTP_RESEND_IP_LIMIT: u32 = 10;
+pub const OTP_RESEND_IP_WINDOW: Duration = Duration::from_secs(3600);
+pub const PAY_READ_LIMIT: u32 = 60;
+pub const PAY_READ_WINDOW: Duration = Duration::from_secs(60);
+pub const PAY_INTENT_LIMIT: u32 = 5;
+pub const PAY_INTENT_WINDOW: Duration = Duration::from_secs(60);
+pub const PAY_STATUS_LIMIT: u32 = 60;
+pub const PAY_STATUS_WINDOW: Duration = Duration::from_secs(60);
+pub const PAY_SIGNING_INFO_LIMIT: u32 = 60;
+pub const PAY_SIGNING_INFO_WINDOW: Duration = Duration::from_secs(60);
+pub const PAY_SUBMIT_LIMIT: u32 = 20;
+pub const PAY_SUBMIT_WINDOW: Duration = Duration::from_secs(60);
+
 /// Bucket key: the client IP plus the endpoint class it is being limited against.
 type BucketKey = (String, &'static str);
 /// Bucket value: when the current fixed window started, and hits so far within it.

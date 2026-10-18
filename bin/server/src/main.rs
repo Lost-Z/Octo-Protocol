@@ -13,7 +13,9 @@ use octo_resilience::ResilienceConfig;
 use octo_store::Store;
 use octo_wallet_core::StellarNetwork;
 use octo_webhooks::WebhookSender;
+use std::future::IntoFuture;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -55,7 +57,9 @@ async fn main() -> Result<()> {
         resilience.retry_policy(),
         resilience.circuit_breaker(),
     )
-    .with_jwt_secret(cfg.jwt_secret.clone());
+    .with_jwt_secret(cfg.jwt_secret.clone())
+    .with_public_api_url(cfg.public_api_url.as_deref())
+    .map_err(anyhow::Error::msg)?;
     // MASTER_KEY_NEXT, when set, activates zero-downtime key rotation: already-migrated rows
     // (by sealed_scheme) sign with this key; un-migrated rows still use `master_key`. Without
     // this call the parsed env var was read into config and then never used anywhere.
@@ -76,18 +80,39 @@ async fn main() -> Result<()> {
         ingest_retry,
         ingest_circuit,
     );
-    tokio::spawn(async move {
-        supervisor
-            .run(
-                Duration::from_secs(cfg.ingest_interval_secs),
-                cfg.ingest_page_limit,
-            )
-            .await;
-    });
+    // Cancelled on SIGTERM/SIGINT; both the ingest loop and the HTTP server drain on it.
+    let shutdown = CancellationToken::new();
+    let ingest = tokio::spawn(supervisor.run_until_cancelled(
+        Duration::from_secs(cfg.ingest_interval_secs),
+        cfg.ingest_page_limit,
+        shutdown.clone(),
+    ));
     tracing::info!(
         interval_secs = cfg.ingest_interval_secs,
         "deposit ingest supervisor started"
     );
+
+    // Periodic background sweep to reconcile sponsorships stuck pending after a crash.
+    let sweep_store = store.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            match sweep_store
+                .reconcile_stale_pending_sponsorships(Duration::from_secs(300))
+                .await
+            {
+                Ok(count) => {
+                    if count > 0 {
+                        tracing::info!(count, "reconciled stale pending sponsored transactions");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "failed to reconcile stale pending sponsorships");
+                }
+            }
+        }
+    });
 
     // REST API.
     let app = build_router(state);
@@ -95,15 +120,92 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind {}", cfg.bind_addr))?;
     tracing::info!(addr = %cfg.bind_addr, "API listening");
+    // Graceful shutdown stops accepting new connections and lets in-flight requests finish.
     // `into_make_service_with_connect_info` is what makes the peer address available to the
     // rate limiter's `ConnectInfo` extractor; without it every caller looks like one client.
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await
-    .context("serve API")?;
+    let mut server = tokio::spawn(
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+        .into_future(),
+    );
+
+    // A server that dies on its own (not via a signal) is a hard failure, not a shutdown.
+    tokio::select! {
+        res = &mut server => {
+            shutdown.cancel();
+            return res.context("API task panicked")?.context("serve API");
+        }
+        signal = shutdown_signal() => {
+            tracing::info!(signal, "shutdown signal received");
+        }
+    }
+
+    shutdown.cancel();
+    tracing::info!(
+        timeout_secs = cfg.shutdown_drain_timeout.as_secs(),
+        "draining in-flight HTTP requests and the current ingest tick"
+    );
+    let ingest_abort = ingest.abort_handle();
+    let server_abort = server.abort_handle();
+    let drain = async { tokio::join!(server, ingest) };
+    match tokio::time::timeout(cfg.shutdown_drain_timeout, drain).await {
+        Ok((http, ingest)) => {
+            let http = http
+                .context("API task panicked")
+                .and_then(|r| r.context("serve API"));
+            if let Err(e) = http {
+                tracing::error!(error = ?e, "API server errored while draining");
+            }
+            if let Err(e) = ingest {
+                tracing::error!(error = ?e, "ingest supervisor task panicked while draining");
+            }
+            tracing::info!("drained");
+        }
+        Err(_) => {
+            // Deposit inserts are deduplicated, so a page cut short here re-runs safely.
+            tracing::warn!(
+                timeout_secs = cfg.shutdown_drain_timeout.as_secs(),
+                "drain timeout elapsed; forcing exit"
+            );
+            ingest_abort.abort();
+            server_abort.abort();
+        }
+    }
+    tracing::info!("exiting");
     Ok(())
+}
+
+/// Resolve on SIGTERM (what Kubernetes/ECS send on a rolling deploy) or SIGINT (Ctrl-C).
+async fn shutdown_signal() -> &'static str {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = ?e, "failed to listen for SIGINT");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(error = ?e, "failed to listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => "SIGINT",
+        () = terminate => "SIGTERM",
+    }
 }
 
 fn init_tracing() {
@@ -122,6 +224,8 @@ struct Config {
     /// Base URL of the hosted checkout frontend (e.g. `https://app.octo.dev`), used to build the
     /// `url` field on payment-link responses. Defaults to the local frontend dev server.
     public_app_url: String,
+    /// Public base URL of this API, for blocking direct self-referential webhook endpoints.
+    public_api_url: Option<String>,
     resend_api_key: String,
     email_from_address: String,
     master_key: [u8; 32],
@@ -134,6 +238,10 @@ struct Config {
     bind_addr: String,
     ingest_interval_secs: u64,
     ingest_page_limit: u32,
+    /// Upper bound on the graceful-shutdown drain (in-flight HTTP requests + the current ingest
+    /// tick) before the process force-exits. `SHUTDOWN_DRAIN_TIMEOUT_SECS`, default 25 — keep it
+    /// below the orchestrator's kill deadline (Kubernetes `terminationGracePeriodSeconds`: 30).
+    shutdown_drain_timeout: Duration,
     /// Resilience settings for all Horizon clients (API + ingest).
     ///
     /// | Variable | Default | Description |
@@ -163,6 +271,9 @@ impl Config {
             .unwrap_or_else(|_| "http://localhost:3000".to_string())
             .trim_end_matches('/')
             .to_string();
+        let public_api_url = std::env::var("PUBLIC_API_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty());
 
         let resend_api_key =
             std::env::var("RESEND_API_KEY").context("RESEND_API_KEY is required")?;
@@ -201,6 +312,13 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(50);
 
+        let shutdown_drain_timeout = Duration::from_secs(
+            std::env::var("SHUTDOWN_DRAIN_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(25),
+        );
+
         let resilience = ResilienceConfig::from_env();
 
         Ok(Config {
@@ -209,6 +327,7 @@ impl Config {
             horizon_url,
             friendbot_url,
             public_app_url,
+            public_api_url,
             resend_api_key,
             email_from_address,
             master_key,
@@ -217,7 +336,20 @@ impl Config {
             bind_addr,
             ingest_interval_secs,
             ingest_page_limit,
+            shutdown_drain_timeout,
             resilience,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_startup_fails_loudly_on_an_unrecognized_configured_network_rather_than_defaulting() {
+        std::env::set_var("DATABASE_URL", "postgres://localhost/test");
+        std::env::set_var("NETWORK", "invalid_network_name");
+        assert!(Config::from_env().is_err());
     }
 }

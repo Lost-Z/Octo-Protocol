@@ -67,6 +67,9 @@ pub async fn create_address(
 
     // Fetch the wallet to learn its base G... account (the muxed addresses encode it).
     let wallet = state.store().get_wallet(wallet_id).await?;
+    if wallet.is_archived() {
+        return Err(ApiError::Forbidden("wallet is archived".into()));
+    }
     let base = wallet.stellar_account_g.clone();
 
     let metadata = req.metadata.unwrap_or_else(|| serde_json::json!({}));

@@ -587,6 +587,14 @@ impl Store {
     /// already migrated (e.g. by a concurrent runner) the update is silently skipped rather than
     /// overwriting a newer record.
     ///
+    /// # Atomicity Guarantee
+    ///
+    /// This method executes a single SQL `UPDATE` statement. Its atomicity guarantee (ensuring
+    /// that a failure mid-write never leaves a wallet row half-migrated or partially updated) relies
+    /// entirely on PostgreSQL's native single-statement atomicity semantics. No application-level
+    /// transaction wrapper is used; Postgres guarantees that a statement either succeeds completely
+    /// or rolls back its effect on the row entirely.
+    ///
     /// Returns `true` if the row was updated, `false` if it was already on the target scheme.
     pub async fn reseal_wallet(
         &self,
@@ -1820,18 +1828,59 @@ impl Store {
         .map_err(StoreError::from_sqlx_conflict)
     }
 
-    /// List the active webhook endpoints for a wallet.
+    /// List the active webhook endpoints for a wallet (active and not soft-deleted).
     pub async fn active_webhook_endpoints(
         &self,
         wallet_id: Uuid,
     ) -> Result<Vec<WebhookEndpoint>, StoreError> {
         let rows = sqlx::query_as::<_, WebhookEndpoint>(
-            "SELECT * FROM webhook_endpoints WHERE wallet_id = $1 AND active = true",
+            "SELECT * FROM webhook_endpoints WHERE wallet_id = $1 AND active = true AND deleted_at IS NULL",
         )
         .bind(wallet_id)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    /// Soft delete a webhook endpoint by setting its deleted_at timestamp and deactivating it.
+    pub async fn delete_webhook(&self, id: Uuid) -> Result<(), StoreError> {
+        sqlx::query("UPDATE webhook_endpoints SET deleted_at = now(), active = false WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Soft delete a webhook endpoint (alias for delete_webhook).
+    pub async fn delete_webhook_endpoint(&self, id: Uuid) -> Result<(), StoreError> {
+        self.delete_webhook(id).await
+    }
+
+    /// List webhook endpoints for a wallet, optionally including soft-deleted ones.
+    pub async fn list_webhooks(
+        &self,
+        wallet_id: Uuid,
+        include_deleted: bool,
+    ) -> Result<Vec<WebhookEndpoint>, StoreError> {
+        let query = if include_deleted {
+            "SELECT * FROM webhook_endpoints WHERE wallet_id = $1 ORDER BY created_at ASC"
+        } else {
+            "SELECT * FROM webhook_endpoints WHERE wallet_id = $1 AND deleted_at IS NULL ORDER BY created_at ASC"
+        };
+        let rows = sqlx::query_as::<_, WebhookEndpoint>(query)
+            .bind(wallet_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows)
+    }
+
+    /// List webhook endpoints for a wallet (alias for list_webhooks).
+    pub async fn list_webhook_endpoints(
+        &self,
+        wallet_id: Uuid,
+        include_deleted: bool,
+    ) -> Result<Vec<WebhookEndpoint>, StoreError> {
+        self.list_webhooks(wallet_id, include_deleted).await
     }
 
     /// Deactivate a webhook endpoint by setting its active status to false.
